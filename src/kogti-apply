@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""kogti-apply - switch this XFCE desktop to the Kogti theme, or back.
+
+  kogti-apply                 apply for the current user (no root needed)
+  kogti-apply --system        ... and also the login screen (asks for a password once)
+  kogti-apply --revert        restore what was there before (add --system for the login screen)
+  kogti-apply --wallpaper NAME / --avatar NAME      choose variants (see --list)
+  kogti-apply --status | --list | --dry-run
+
+Everything it touches is recorded in ~/.local/state/<id>/journal.json so that --revert is exact.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+DATA = Path(os.environ.get("KOGTI_DATA", "/usr/share/kogti"))
+T = json.loads((DATA / "theme.json").read_text(encoding="utf-8"))
+NAME, ID = T["name"], T["id"]
+COL = T["colors"]
+
+HOME = Path(os.environ.get("HOME") or str(Path.home()))
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / ID
+JOURNAL = STATE / "journal.json"
+BEGIN = f"/* >>> {ID}: managed by kogti-apply >>> */"
+END = f"/* <<< {ID} <<< */"
+SH_BEGIN = f"# >>> {ID}: managed by kogti-apply >>>"
+SH_END = f"# <<< {ID} <<<"
+
+DRY = False
+FAKE = os.environ.get("KOGTI_FAKE_XFCONF")  # path to a JSON file: lets the logic run without XFCE (tests)
+
+
+def say(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def run(cmd: list[str], capture: bool = False, readonly: bool = False) -> subprocess.CompletedProcess:
+    """Run a command. In --dry-run only read-only queries are really executed."""
+    if DRY and not readonly:
+        say("  + " + " ".join(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    try:
+        return subprocess.run(cmd, capture_output=capture, text=True)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: not found")
+
+
+def which(prog: str) -> bool:
+    return shutil.which(prog) is not None
+
+
+# ---------------------------------------------------------------- journal ----
+class Journal:
+    def __init__(self) -> None:
+        self.d: dict = {"xfconf": {}, "files": {}, "gsettings": {}, "applied": False}
+        if JOURNAL.exists():
+            self.d.update(json.loads(JOURNAL.read_text(encoding="utf-8")))
+
+    def save(self) -> None:
+        if DRY:
+            return
+        STATE.mkdir(parents=True, exist_ok=True)
+        JOURNAL.write_text(json.dumps(self.d, indent=1), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- xfconf -----
+def _fake() -> dict:
+    p = Path(FAKE)
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def _fake_save(d: dict) -> None:
+    Path(FAKE).write_text(json.dumps(d))
+
+
+def xf_list(ch: str) -> list[str]:
+    if FAKE:
+        return sorted(k.split("|", 1)[1] for k in _fake() if k.startswith(ch + "|"))
+    r = run(["xfconf-query", "-c", ch, "-l"], capture=True, readonly=True)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def xf_get(ch: str, prop: str) -> list[str] | None:
+    if FAKE:
+        return _fake().get(f"{ch}|{prop}")
+    r = run(["xfconf-query", "-c", ch, "-p", prop], capture=True, readonly=True)
+    if r.returncode != 0:
+        return None
+    lines = r.stdout.splitlines()
+    if lines and lines[0].startswith("Value is an array"):
+        return [x for x in lines[1:] if x != ""]
+    return [lines[0]] if lines else [""]
+
+
+def _fmt(kind: str, v) -> str:
+    if kind == "bool":
+        return "true" if v in (True, "true", "True", 1) else "false"
+    if kind == "double":
+        return "%.4f" % float(v)
+    return str(v)
+
+
+def xf_set(j: Journal, ch: str, prop: str, kind: str, values: list) -> None:
+    key = f"{ch}|{prop}"
+    if key not in j.d["xfconf"]:
+        j.d["xfconf"][key] = {"old": xf_get(ch, prop), "kind": kind}
+    vals = [_fmt(kind, v) for v in values]
+    if FAKE and not DRY:
+        d = _fake()
+        d[key] = vals
+        _fake_save(d)
+        return
+    cmd = ["xfconf-query", "-c", ch, "-p", prop, "-n"]
+    if len(vals) > 1:
+        cmd.append("-a")
+    for v in vals:
+        cmd += ["-t", kind, "-s", v]
+    run(cmd)
+
+
+def xf_restore(j: Journal) -> None:
+    for key, rec in j.d["xfconf"].items():
+        ch, prop = key.split("|", 1)
+        old, kind = rec["old"], rec["kind"]
+        if FAKE and not DRY:
+            d = _fake()
+            if old is None:
+                d.pop(key, None)
+            else:
+                d[key] = old
+            _fake_save(d)
+        elif old is None:
+            run(["xfconf-query", "-c", ch, "-p", prop, "-r"])
+        else:
+            cmd = ["xfconf-query", "-c", ch, "-p", prop, "-n"] + (["-a"] if len(old) > 1 else [])
+            for v in old:
+                cmd += ["-t", kind, "-s", v]
+            run(cmd)
+
+
+# ---------------------------------------------------------------- files ------
+def remember_file(j: Journal | None, path: Path) -> None:
+    if j is None:
+        return
+    k = str(path)
+    if k in j.d["files"]:
+        return
+    if path.exists():
+        bak = STATE / "backup" / re.sub(r"[^A-Za-z0-9._-]", "_", k)
+        if not DRY:
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, bak)
+        j.d["files"][k] = str(bak)
+    else:
+        j.d["files"][k] = None
+
+
+def write_file(j: Journal, path: Path, text: str) -> None:
+    remember_file(j, path)
+    if DRY:
+        say(f"  + write {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def ini_set(j: Journal | None, path: Path, section: str | None, kv: dict[str, str]) -> None:
+    """Line-based editor that keeps comments and key order. section=None for header-less files."""
+    remember_file(j, path)
+    lines = path.read_text(encoding="utf-8").split("\n") if path.exists() else []
+    if lines and lines[-1] == "":
+        lines.pop()
+    start, end = 0, len(lines)
+    if section is not None:
+        hdr = f"[{section}]"
+        idx = next((i for i, l in enumerate(lines) if l.strip() == hdr), None)
+        if idx is None:
+            lines += ([""] if lines else []) + [hdr]
+            start, end = len(lines), len(lines)
+        else:
+            start = idx + 1
+            end = next((i for i in range(start, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+    for k, v in kv.items():
+        pat = re.compile(rf"^\s*{re.escape(k)}\s*=")
+        pos = next((i for i in range(start, end) if pat.match(lines[i])), None)
+        if pos is not None:
+            lines[pos] = f"{k}={v}"
+        else:
+            lines.insert(end, f"{k}={v}")
+            end += 1
+    if DRY:
+        say(f"  + edit {path}: " + ", ".join(f"{k}={v}" for k, v in kv.items()))
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def block_set(j: Journal, path: Path, text: str, begin: str = BEGIN, end: str = END) -> None:
+    remember_file(j, path)
+    cur = path.read_text(encoding="utf-8") if path.exists() else ""
+    cur = re.sub(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", cur, flags=re.S).rstrip("\n")
+    new = (cur + "\n\n" if cur else "") + f"{begin}\n{text.rstrip()}\n{end}\n"
+    if DRY:
+        say(f"  + managed block in {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
+
+
+def files_restore(j: Journal) -> None:
+    for k, bak in j.d["files"].items():
+        p = Path(k)
+        if DRY:
+            say(f"  + restore {p}")
+        elif bak is None:
+            p.unlink(missing_ok=True)
+        elif Path(bak).exists():
+            shutil.copy2(bak, p)
+
+
+# ---------------------------------------------------------------- gsettings --
+def gs_set(j: Journal, schema: str, key: str, value: str) -> None:
+    if not which("gsettings"):
+        return
+    r = run(["gsettings", "get", schema, key], capture=True, readonly=True)
+    if r.returncode != 0:
+        return
+    k = f"{schema} {key}"
+    j.d["gsettings"].setdefault(k, r.stdout.strip())
+    run(["gsettings", "set", schema, key, value])
+
+
+def gs_restore(j: Journal) -> None:
+    for k, old in j.d["gsettings"].items():
+        schema, key = k.split(" ", 1)
+        if old:
+            run(["gsettings", "set", schema, key, old])
+
+
+# ---------------------------------------------------------------- steps ------
+def hex_floats(h: str) -> list[float]:
+    h = h.lstrip("#")
+    return [int(h[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+
+
+def step_gtk(j: Journal) -> None:
+    say("GTK, icons, window borders")
+    xf_set(j, "xsettings", "/Net/ThemeName", "string", [NAME])
+    xf_set(j, "xsettings", "/Net/IconThemeName", "string", [NAME])
+    xf_set(j, "xfwm4", "/general/theme", "string", [NAME])
+    if T.get("cursor"):
+        xf_set(j, "xsettings", "/Gtk/CursorThemeName", "string", [T["cursor"]])
+    if T.get("font_ui"):
+        xf_set(j, "xsettings", "/Gtk/FontName", "string", [T["font_ui"]])
+    for ver in ("gtk-3.0", "gtk-4.0"):
+        ini_set(
+            j,
+            CONFIG / ver / "settings.ini",
+            "Settings",
+            {
+                "gtk-theme-name": NAME,
+                "gtk-icon-theme-name": NAME,
+                "gtk-application-prefer-dark-theme": "true",
+            },
+        )
+    css = DATA / "gtk-4.0-user.css"
+    if css.exists():
+        block_set(j, CONFIG / "gtk-4.0" / "gtk.css", css.read_text(encoding="utf-8"))
+    gs_set(j, "org.gnome.desktop.interface", "color-scheme", "'prefer-dark'")
+    gs_set(j, "org.gnome.desktop.interface", "gtk-theme", f"'{NAME}'")
+    gs_set(j, "org.gnome.desktop.interface", "icon-theme", f"'{NAME}'")
+
+
+def step_wallpaper(j: Journal, key: str) -> None:
+    path = T["wallpapers"].get(key)
+    if not path:
+        raise SystemExit(f"unknown wallpaper '{key}' (see --list)")
+    say(f"Wallpaper: {key}")
+    props = [p for p in xf_list("xfce4-desktop") if p.endswith("/last-image")]
+    if not props and not DRY:
+        say("  (xfdesktop has no per-monitor settings yet; right-click the desktop once, then re-run)")
+    for p in props:
+        base = p.rsplit("/", 1)[0]
+        xf_set(j, "xfce4-desktop", p, "string", [path])
+        xf_set(j, "xfce4-desktop", base + "/image-style", "int", [5])
+        xf_set(j, "xfce4-desktop", base + "/color-style", "int", [0])
+        xf_set(j, "xfce4-desktop", base + "/rgba1", "double", hex_floats(COL["ink"]) + [1.0])
+
+
+def step_panel(j: Journal) -> None:
+    say("Panel and menu")
+    props = xf_list("xfce4-panel")
+    panels = sorted({int(m.group(1)) for p in props if (m := re.match(r"/panels/panel-(\d+)/", p))})
+    for n in panels:
+        xf_set(j, "xfce4-panel", f"/panels/panel-{n}/background-style", "int", [1])
+        xf_set(j, "xfce4-panel", f"/panels/panel-{n}/background-rgba", "double", hex_floats(COL["ink"]) + [1.0])
+    xf_set(j, "xfce4-panel", "/panels/dark-mode", "bool", [True])
+    for p in props:
+        m = re.match(r"/plugins/plugin-(\d+)$", p)
+        if m and (xf_get("xfce4-panel", p) or [""])[0] == "whiskermenu":
+            ini_set(j, CONFIG / "xfce4" / "panel" / f"whiskermenu-{m.group(1)}.rc", None, {"button-icon": T["menu_icon"]})
+
+
+def step_terminal(j: Journal) -> None:
+    say("Terminal colours")
+    ini_set(
+        j,
+        CONFIG / "xfce4" / "terminal" / "terminalrc",
+        "Configuration",
+        {
+            "ColorForeground": COL["bone"],
+            "ColorBackground": COL["ink"],
+            "ColorCursorUseDefault": "FALSE",
+            "ColorCursor": COL["amber"],
+            "ColorCursorForeground": COL["ink"],
+            "ColorBoldUseDefault": "TRUE",
+            "ColorPalette": ";".join(c.lower() for c in T["ansi"]),
+        },
+    )
+
+
+def step_qt(j: Journal) -> None:
+    if not (which("qt5ct") or which("qt6ct")):
+        say("Qt: qt5ct/qt6ct not installed - skipped (sudo apt install qt5ct qt6ct, then re-run)")
+        return
+    say("Qt applications")
+    for tool in ("qt5ct", "qt6ct"):
+        scheme = DATA / "qt" / "kogti.conf"
+        if not scheme.exists():
+            continue
+        dest = CONFIG / tool / "colors" / "kogti.conf"
+        write_file(j, dest, scheme.read_text(encoding="utf-8"))
+        ini_set(
+            j,
+            CONFIG / tool / f"{tool}.conf",
+            "Appearance",
+            {
+                "color_scheme_path": str(dest),
+                "custom_palette": "true",
+                "icon_theme": NAME,
+                "style": "Fusion",
+            },
+        )
+    plat = "qt5ct" if which("qt5ct") else "qt6ct"
+    block_set(j, HOME / ".xsessionrc", f"export QT_QPA_PLATFORMTHEME={plat}", SH_BEGIN, SH_END)
+    say("  Qt picks the theme up at the next login")
+
+
+def step_avatar(j: Journal, key: str) -> None:
+    src = T["avatars"].get(key)
+    if not src:
+        raise SystemExit(f"unknown avatar '{key}' (see --list)")
+    say(f"Avatar: {key}")
+    remember_file(j, HOME / ".face")
+    if DRY:
+        say(f"  + copy {src} -> ~/.face")
+    else:
+        shutil.copy2(src, HOME / ".face")
+
+
+def restart_shell() -> None:
+    if DRY:
+        return
+    if which("xfce4-panel") and subprocess.run(["pgrep", "-x", "xfce4-panel"], capture_output=True).returncode == 0:
+        subprocess.Popen(["xfce4-panel", "-r"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if which("xfdesktop") and subprocess.run(["pgrep", "-x", "xfdesktop"], capture_output=True).returncode == 0:
+        subprocess.Popen(["xfdesktop", "--reload"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- system -----
+def invoking_user() -> pwd.struct_passwd:
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID") or str(os.getuid())
+    return pwd.getpwuid(int(uid))
+
+
+def system_helper(revert: bool, wall_key: str, avatar_key: str) -> int:
+    """Runs as root (via pkexec/sudo). Only reads files shipped by the package, never user-supplied paths."""
+    if os.geteuid() != 0:
+        raise SystemExit("--system-helper must run as root")
+    user = invoking_user()
+    conf = Path("/etc/lightdm/lightdm-gtk-greeter.conf")
+    var = Path("/var/lib") / ID
+    orig = var / "lightdm-gtk-greeter.conf.orig"
+    none = var / "lightdm-gtk-greeter.conf.absent"
+    as_dir = Path("/var/lib/AccountsService")
+    icon = as_dir / "icons" / user.pw_name
+    as_user = as_dir / "users" / user.pw_name
+    as_bak = var / f"accountsservice-{user.pw_name}.orig"
+    icon_bak = var / f"accountsservice-{user.pw_name}.icon"
+
+    if revert:
+        if orig.exists():
+            shutil.copy2(orig, conf)
+        elif none.exists():
+            conf.unlink(missing_ok=True)
+        for src, dst in ((as_bak, as_user), (icon_bak, icon)):
+            if src.exists():
+                shutil.copy2(src, dst)
+        say("Login screen restored")
+        return 0
+
+    var.mkdir(parents=True, exist_ok=True)
+    if not orig.exists() and not none.exists():
+        if conf.exists():
+            shutil.copy2(conf, orig)
+        else:
+            none.write_text("")
+    wall = T["wallpapers"].get(wall_key) or T["wallpapers"]["logo"]
+    avatar = T["avatars"].get(avatar_key) or T["avatars"]["default"]
+    kv = {
+        "theme-name": NAME,
+        "icon-theme-name": NAME,
+        "background": wall,
+        "default-user-image": T["avatar_pixmap"],
+        "user-background": "false",
+    }
+    ini_set(None, conf, "greeter", kv)
+    if as_dir.exists():
+        for src, bak in ((as_user, as_bak), (icon, icon_bak)):
+            if not bak.exists() and src.exists():
+                shutil.copy2(src, bak)
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(avatar, icon)
+        os.chmod(icon, 0o644)
+        ini_set(None, as_user, "User", {"Icon": str(icon)})
+        os.chmod(as_user, 0o600)
+    say("Login screen updated")
+    return 0
+
+
+def system_part(revert: bool, wall_key: str, avatar_key: str) -> None:
+    say("Login screen (needs administrator rights)")
+    me = str(Path(sys.argv[0]).resolve())
+    cmd = [me, "--system-helper", "--wallpaper", wall_key, "--avatar", avatar_key] + (["--revert"] if revert else [])
+    if DRY:
+        say("  + (as root) " + " ".join(cmd))
+        return
+    if os.geteuid() == 0:
+        subprocess.run(cmd, check=False)
+    elif which("pkexec") and os.environ.get("DISPLAY"):
+        subprocess.run(["pkexec"] + cmd, check=False)
+    elif which("sudo"):
+        subprocess.run(["sudo"] + cmd, check=False)
+    else:
+        say("  skipped: neither pkexec nor sudo available")
+
+
+# ---------------------------------------------------------------- main -------
+def status() -> None:
+    def cur(ch: str, p: str) -> str:
+        v = xf_get(ch, p)
+        return v[0] if v else "-"
+
+    say(f"GTK theme   : {cur('xsettings', '/Net/ThemeName')}")
+    say(f"Icon theme  : {cur('xsettings', '/Net/IconThemeName')}")
+    say(f"Window theme: {cur('xfwm4', '/general/theme')}")
+    say(f"Applied by kogti-apply: {'yes' if JOURNAL.exists() else 'no'}")
+
+
+def main() -> int:
+    global DRY
+    ap = argparse.ArgumentParser(prog="kogti-apply", description=f"Apply the {NAME} desktop theme.")
+    ap.add_argument("--system", action="store_true", help="also set the login screen (LightDM)")
+    ap.add_argument("--revert", action="store_true", help="undo")
+    ap.add_argument("--wallpaper", default=T["default_wallpaper"], help="wallpaper name (see --list)")
+    ap.add_argument("--avatar", default="default", help="avatar name (see --list)")
+    ap.add_argument("--no-restart", action="store_true", help="do not restart panel/desktop")
+    ap.add_argument("--notify", action="store_true", help="desktop notification when done")
+    ap.add_argument("--dry-run", action="store_true", help="print what would be done")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--system-helper", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    DRY = a.dry_run
+
+    if a.system_helper:
+        return system_helper(a.revert, a.wallpaper, a.avatar)
+    if a.list:
+        say("wallpapers: " + ", ".join(T["wallpapers"]))
+        say("avatars   : " + ", ".join(k for k in T["avatars"] if k != "default"))
+        return 0
+    if a.status:
+        status()
+        return 0
+    if os.geteuid() == 0 and not FAKE:
+        raise SystemExit("Run kogti-apply as your normal user, not as root (it asks for rights itself when needed).")
+
+    j = Journal()
+    if a.revert:
+        say("Reverting...")
+        xf_restore(j)
+        files_restore(j)
+        gs_restore(j)
+        if not DRY:
+            JOURNAL.unlink(missing_ok=True)
+        if a.system:
+            system_part(True, a.wallpaper, a.avatar)
+        if not a.no_restart:
+            restart_shell()
+        say("Done.")
+        return 0
+
+    try:
+        step_gtk(j)
+        step_wallpaper(j, a.wallpaper)
+        step_panel(j)
+        step_terminal(j)
+        step_qt(j)
+        step_avatar(j, a.avatar)
+        j.d["applied"] = True
+    finally:
+        j.save()
+    if a.system:
+        system_part(False, a.wallpaper, a.avatar)
+    if not a.no_restart:
+        restart_shell()
+    say("Done." + ("" if a.system else "  Add --system to theme the login screen as well."))
+    if a.notify and which("notify-send") and not DRY:
+        subprocess.run(["notify-send", NAME, "Theme applied"], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

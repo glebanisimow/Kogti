@@ -1,0 +1,51 @@
+# Kogti - single source of truth for the whole theme.
+# Everything (GTK3/4, xfwm4, icons, terminal, Qt, wallpapers, greeter) is generated from this file.
+# Change a value, run `python build.py`, install the new .deb.
+
+[theme]
+id          = "kogti"                       # package name becomes xfce-<id>
+name        = "Kogti"                       # theme directory / xfconf name
+version     = "0.1.0"
+maintainer  = "Kogti Theme <noreply@localhost>"
+description = "Dark XFCE theme in ink, amber and bone (claws, ice axe, hexagon)"
+
+# Colours measured from the design book PNGs (exact pixel values).
+[brand]
+ink   = "#0A0A09"   # background of every design-book piece
+amber = "#FFAA1D"   # the one accent
+bone  = "#F4F1E8"   # warm off-white, used instead of pure white
+
+# NOT in the design book: status colours are required by UI (errors, success, info).
+# Picked to sit next to amber without competing with it. Adjust freely.
+[status]
+danger  = "#E5533D"
+success = "#8FB339"
+info    = "#6BA6C4"
+
+# Extra terminal hues (also not in the design book).
+[ansi_extra]
+magenta = "#B8789F"
+cyan    = "#6FB5A8"
+
+[geometry]
+radius        = 2      # px; every rounded corner in the GTK stylesheets is clamped to this
+titlebar      = 30     # xfwm4 title bar height, px
+border        = 3      # xfwm4 side/bottom border, px
+accent_line   = 2      # amber line under the active title bar, px
+
+[assets]
+avatar            = "06-profil-b_circle.png"   # also available: 06-profil-b_hex, 07-ledorub-inv_circle, ...
+menu_glyph        = "glif-kogti-amber.png"     # Whisker menu button
+wallpaper_logo    = "01-kogti-disk_square.png"
+wallpaper_default = "logo"                     # logo | claws | tracks | rows | teeth
+pattern_strength  = 0.14                       # 0..1, how much of the amber survives in pattern wallpapers
+
+[assets.patterns]
+claws  = "uzor-kogti-ink-3x3.png"
+tracks = "uzor-sledy-ink-3x3.png"
+rows   = "uzor-stroki-ink-3x3.png"
+teeth  = "uzor-zuby-ink-3x3.png"
+
+[desktop]
+font_ui   = ""        # empty = keep the system font
+cursor    = ""        # empty = keep the current cursor theme
